@@ -1,93 +1,128 @@
-const low = require('lowdb');
-const FileSync = require('lowdb/adapters/FileSync');
-const path = require('path');
 const { nanoid } = require('nanoid');
-const fs = require('fs');
+const { githubRead, githubWrite } = require('./github-api');
 
-const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, '../../data/tutor.json');
-const dir = path.dirname(DB_PATH);
-if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-const adapter = new FileSync(DB_PATH);
-const db = low(adapter);
+const REPO_PATH = 'data';
+let _cache = null;
+let initialized = false;
 
-// ── Schema ──
-db.defaults({ users: [], sessions: [] }).write();
+async function loadDB() {
+  if (_cache) return _cache;
+  try {
+    const raw = await githubRead(`${REPO_PATH}/db.json`);
+    _cache = raw ? JSON.parse(raw) : { users: [], sessions: [] };
+  } catch (e) {
+    console.error('DB load error:', e.message);
+    _cache = { users: [], sessions: [] };
+  }
+  return _cache;
+}
 
-// ── Users ──
-function getOrCreateUser(chatId, username = '') {
-  let user = db.get('users').find({ chatId: String(chatId) }).value();
+async function saveDB() {
+  if (!_cache) return;
+  try {
+    await githubWrite(`${REPO_PATH}/db.json`, JSON.stringify(_cache, null, 2));
+  } catch (e) {
+    console.error('DB save error:', e.message);
+  }
+}
+
+async function setup() {
+  try {
+    const exists = await githubRead(`${REPO_PATH}/db.json`).catch(() => null);
+    if (!exists) {
+      await saveDB();
+    }
+    initialized = true;
+  } catch (e) {
+    console.error('DB setup failed:', e.message);
+    throw e;
+  }
+}
+
+// Users
+async function getOrCreateUser(chatId, username = '') {
+  const db = await loadDB();
+  let user = db.users.find(u => u.chatId === String(chatId));
   if (!user) {
-    user = { chatId: String(chatId), username, curriculum: null, progress: {}, createdAt: new Date().toISOString() };
-    db.get('users').push(user).write();
+    user = { chatId: String(chatId), username, voiceEnabled: true, createdAt: new Date().toISOString() };
+    db.users.push(user);
+    await saveDB();
   }
   return user;
 }
 
-function updateUser(chatId, patch) {
-  return db.get('users').find({ chatId: String(chatId) }).assign(patch).write();
+async function updateUser(chatId, patch) {
+  const db = await loadDB();
+  const user = db.users.find(u => u.chatId === String(chatId));
+  if (user) Object.assign(user, patch);
+  await saveDB();
+  return user;
 }
 
-function getUser(chatId) {
-  return db.get('users').find({ chatId: String(chatId) }).value();
+async function getUser(chatId) {
+  const db = await loadDB();
+  return db.users.find(u => u.chatId === String(chatId)) || null;
 }
 
-// ── Sessions (conversation state) ──
-function openSession(chatId, curriculum) {
+// Sessions
+async function openSession(chatId, curriculum) {
+  const db = await loadDB();
   const session = {
     id: nanoid(),
     chatId: String(chatId),
     curriculum,
     currentModule: 0,
     currentTopic: 0,
-    history: [],           // [{ role, content, ts }]
-    quizBuffer: [],        // upcoming questions
+    history: [],
+    quizBuffer: [],
+    quizMode: false,
     quizScore: { total: 0, correct: 0 },
     weakAreas: [],
     masterAreas: [],
     createdAt: new Date().toISOString(),
   };
-  db.get('sessions').push(session).write();
-  // Also attach to user for quick lookup
-  updateUser(chatId, { sessionId: session.id });
+  db.sessions.push(session);
+  await saveDB();
   return session;
 }
 
-function getSession(chatId) {
-  const userId = String(chatId);
-  const s = db.get('sessions').find({ chatId: userId }).value();
-  return s || null;
+async function getSession(chatId) {
+  const db = await loadDB();
+  return db.sessions.find(s => s.chatId === String(chatId)) || null;
 }
 
-function getSessionById(sid) {
-  return db.get('sessions').find({ id: sid }).value();
+async function updateSession(chatId, patch) {
+  const db = await loadDB();
+  const s = db.sessions.find(x => x.chatId === String(chatId));
+  if (s) {
+    Object.assign(s, patch);
+    await saveDB();
+  }
+  return s;
 }
 
-function updateSession(chatId, patch) {
-  return db.get('sessions').find({ chatId: String(chatId) }).assign(patch).write();
+async function appendHistory(chatId, role, content) {
+  const db = await loadDB();
+  const s = db.sessions.find(x => x.chatId === String(chatId));
+  if (!s) return;
+  s.history = s.history.slice(-30);
+  s.history.push({ role, content, ts: new Date().toISOString() });
+  await saveDB();
 }
 
-function appendHistory(chatId, role, content) {
-  const session = getSession(chatId);
-  if (!session) return;
-  session.history = session.history.slice(-30);  // keep last 30 msgs
-  session.history.push({ role, content, ts: new Date().toISOString() });
-  db.get('sessions').find({ chatId: String(chatId) }).assign({ history: session.history }).write();
+async function recordQuizResult(chatId, correct) {
+  const db = await loadDB();
+  const s = db.sessions.find(x => x.chatId === String(chatId));
+  if (!s) return;
+  s.quizScore.total += 1;
+  if (correct) s.quizScore.correct += 1;
+  await saveDB();
 }
 
-function recordQuizResult(chatId, correct) {
-  const session = getSession(chatId);
-  if (!session) return;
-  session.quizScore.total += 1;
-  if (correct) session.quizScore.correct += 1;
-  db.get('sessions').find({ chatId: String(chatId) }).assign({ quizScore: session.quizScore }).write();
-}
-
-// ── Helpers ──
-function getStats() {
-  return {
-    users: db.get('users').size().value(),
-    sessions: db.get('sessions').size().value(),
-  };
+// Stats
+async function getStats() {
+  const db = await loadDB();
+  return { users: db.users.length, sessions: db.sessions.length };
 }
 
 module.exports = {
@@ -96,10 +131,11 @@ module.exports = {
   getUser,
   openSession,
   getSession,
-  getSessionById,
   updateSession,
   appendHistory,
   recordQuizResult,
   getStats,
-  nanoid,
+  initialized,
+  setup,
+  saveDB,
 };
